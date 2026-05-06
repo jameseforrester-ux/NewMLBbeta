@@ -21,7 +21,7 @@ from polymarket import (
     get_todays_mlb_markets, get_market_implied_odds,
     track_line_movement, get_line_movement,
 )
-from model import analyze_game, find_edges, kelly_criterion, calculate_stake, generate_reasoning
+from model_v2 import kelly_criterion, calculate_stake, generate_reasoning_v2
 from database import (
     get_bankroll, get_min_edge, get_kelly_fraction,
     log_alert, log_bet,

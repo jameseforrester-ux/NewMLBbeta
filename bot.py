@@ -41,9 +41,8 @@ from polymarket import (
     get_todays_mlb_markets, get_market_implied_odds,
     search_mlb_markets,
 )
-from model import (
-    analyze_game, find_edges, kelly_criterion,
-    calculate_stake, generate_reasoning,
+from model_v2 import (
+    kelly_criterion, calculate_stake, generate_reasoning_v2,
 )
 from formatters import (
     format_main_menu, format_games_list, format_game_card,
@@ -637,13 +636,17 @@ async def _show_analysis(query: CallbackQuery, context, game_id: int):
     min_edge = await get_min_edge()
 
     try:
-        analysis, edges = await _analyze_single_game(game, markets, min_edge)
+        analysis, edges, value_plays, _ = await _analyze_single_game(game, markets, min_edge)
         text = format_analysis(game, analysis)
 
         if edges:
             text += f"\n\n{E['diamond']} *{len(edges)} edge(s) found!*\n"
             for edge in edges[:3]:
                 text += f"  {E['target']} {edge['bet_desc']}: +{edge['edge_pct']:.1f}%\n"
+        elif value_plays:
+            text += f"\n\n{E['chart']} *{len(value_plays)} value play(s) vs Vegas*\n"
+            for vp in value_plays[:2]:
+                text += f"  {E['target']} {vp['bet_desc']}: +{vp['gap_pct']:.1f}% gap\n"
 
         await query.message.reply_text(
             text, parse_mode=ParseMode.MARKDOWN,
@@ -672,9 +675,9 @@ async def _show_game_edge(query: CallbackQuery, context, game_id: int):
     kelly_frac = await get_kelly_fraction()
 
     try:
-        analysis, edges = await _analyze_single_game(game, markets, min_edge)
+        analysis, edges, value_plays, _ = await _analyze_single_game(game, markets, min_edge)
 
-        if not edges:
+        if not edges and not value_plays:
             await query.message.reply_text(
                 f"{E['mag']} No edges found meeting {min_edge}% threshold.\n"
                 f"Market may be efficiently priced for this game.",
@@ -682,12 +685,28 @@ async def _show_game_edge(query: CallbackQuery, context, game_id: int):
             )
             return
 
+        if not edges and value_plays:
+            # No Poly edge but model has value vs Vegas — show it
+            lines = [f"{E['diamond']} *No Polymarket edge found, but model sees value vs sharp books:*\n"]
+            for vp in value_plays[:3]:
+                lines.append(
+                    f"{E['target']} {vp['bet_desc']}\n"
+                    f"  Gap vs Vegas: `+{vp['gap_pct']:.1f}%`\n"
+                    f"  {vp['reasoning']}\n"
+                )
+            await query.message.reply_text(
+                "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=game_detail_keyboard(game_id),
+            )
+            return
+
         for edge in edges[:3]:
             kelly = kelly_criterion(edge["model_prob"], edge["price"], kelly_frac)
             stake = calculate_stake(bankroll, kelly["kelly_pct"])
-            reasoning = generate_reasoning(analysis, edge, game)
+            reasoning = generate_reasoning_v2(analysis, edge, game)
             alert_msg = format_edge_alert(game, edge, analysis, kelly, stake)
-            full_msg = f"{alert_msg}\n\n{reasoning}"
+            heis_note = f"\n\n{E['diamond']} *Smart money confirms this side*" if edge.get("heis_confirms") else ""
+            full_msg = f"{alert_msg}\n\n{reasoning}{heis_note}"
 
             await query.message.reply_text(
                 full_msg, parse_mode=ParseMode.MARKDOWN,
@@ -797,20 +816,24 @@ async def _show_game_markets(query: CallbackQuery, context, game_id: int):
 
 async def _run_edge_scan(target, context):
     """Full edge scan across all today's games."""
-    msg = await _send_msg(target, f"{E['refresh']} Scanning entire slate for edges...")
+    await _send_msg(target, f"{E['refresh']} Scanning entire slate for edges...")
 
-    games = await get_todays_schedule()
-    markets = await get_todays_mlb_markets()
-    bankroll = await get_bankroll()
-    min_edge = await get_min_edge()
+    games      = await get_todays_schedule()
+    markets    = await get_todays_mlb_markets()
+    bankroll   = await get_bankroll()
+    min_edge   = await get_min_edge()
     kelly_frac = await get_kelly_fraction()
 
-    all_picks = []
+    all_picks  = []
+    best_value = []
+
     for game in games:
         if game.get("status") not in ("Scheduled", "Pre-Game", "Warmup", "In Progress"):
             continue
         try:
-            analysis, edges = await _analyze_single_game(game, markets, min_edge)
+            analysis, edges, value_plays, _ = await _analyze_single_game(
+                game, markets, min_edge
+            )
             for edge in edges:
                 kelly = kelly_criterion(edge["model_prob"], edge["price"], kelly_frac)
                 if kelly["should_bet"]:
@@ -819,22 +842,40 @@ async def _run_edge_scan(target, context):
                         "game": game, "analysis": analysis,
                         "edge": edge, "kelly": kelly, "stake": stake,
                     })
+            for vp in value_plays:
+                vp["game"] = game
+                best_value.append(vp)
         except Exception as e:
             log.warning(f"Scan error for {game.get('game_id')}: {e}")
 
     all_picks.sort(key=lambda p: p["edge"]["edge_pct"], reverse=True)
+    best_value.sort(key=lambda p: p.get("gap_pct", 0), reverse=True)
 
+    # ── Digest ────────────────────────────────────────────────────────────
     digest = format_daily_digest(all_picks)
     await _send_msg(target, digest, ParseMode.MARKDOWN, main_menu_keyboard())
 
-    # Send top 3 detailed
+    # ── Best value plays ──────────────────────────────────────────────────
+    if best_value:
+        bv_lines = [f"{E['diamond']} *Best Value — Model vs Vegas*\n━━━━━━━━━━━━━━━━━━━━━━━\n"]
+        for vp in best_value[:5]:
+            g = vp.get("game", {})
+            bv_lines.append(
+                f"*{g.get('away_abbrev','?')} @ {g.get('home_abbrev','?')}*\n"
+                f"  {E['target']} {vp['bet_desc']} — `+{vp['gap_pct']:.1f}%` gap\n"
+                f"  {vp['reasoning']}\n"
+            )
+        await _send_msg(target, "\n".join(bv_lines), ParseMode.MARKDOWN)
+
+    # ── Top 3 detailed cards ──────────────────────────────────────────────
     for pick in all_picks[:3]:
-        reasoning = generate_reasoning(pick["analysis"], pick["edge"], pick["game"])
+        reasoning = generate_reasoning_v2(pick["analysis"], pick["edge"], pick["game"])
         alert_msg = format_edge_alert(
             pick["game"], pick["edge"],
             pick["analysis"], pick["kelly"], pick["stake"],
         )
-        await _send_msg(target, f"{alert_msg}\n\n{reasoning}", ParseMode.MARKDOWN)
+        heis_note = f"\n\n{E['diamond']} *Smart money confirms this side*" if pick["edge"].get("heis_confirms") else ""
+        await _send_msg(target, f"{alert_msg}\n\n{reasoning}{heis_note}", ParseMode.MARKDOWN)
         await asyncio.sleep(0.5)
 
 
