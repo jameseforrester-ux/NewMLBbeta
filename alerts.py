@@ -69,85 +69,111 @@ def _mark_fired(game_id: int, alert_type: str):
 
 async def run_daily_digest(context) -> None:
     """
-    Scheduled job: scans all today's games, runs the model,
-    compares to Polymarket, sends digest of top edges.
+    Scheduled job: scans all today's games, runs the 4-layer model,
+    compares to Polymarket, sends digest of top edges + best value plays.
     """
+    from model_v2 import kelly_criterion, calculate_stake, generate_reasoning_v2
+
     chat_id = context.job.data.get("chat_id")
     if not chat_id:
         return
 
-    log.info("Running daily digest...")
+    log.info("Running daily digest (v2)...")
 
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{E['refresh']} Scanning today's slate...",
+            text=f"{E['refresh']} Scanning today's slate across all 4 model layers...",
         )
 
-        games = await get_todays_schedule()
+        games   = await get_todays_schedule()
         markets = await get_todays_mlb_markets()
-        bankroll = await get_bankroll()
-        min_edge = await get_min_edge()
-        kelly_frac = await get_kelly_fraction()
+        bankroll    = await get_bankroll()
+        min_edge    = await get_min_edge()
+        kelly_frac  = await get_kelly_fraction()
 
-        all_picks = []
+        all_picks  = []
+        best_value = []
 
         for game in games:
             if game.get("status") not in ("Scheduled", "Pre-Game", "Warmup"):
                 continue
-
             try:
-                analysis, edges = await _analyze_single_game(game, markets, min_edge)
-                if not edges:
-                    continue
-
+                analysis, edges, value_plays, _ = await _analyze_single_game(
+                    game, markets, min_edge
+                )
                 for edge in edges:
                     kelly = kelly_criterion(edge["model_prob"], edge["price"], kelly_frac)
                     if not kelly["should_bet"]:
                         continue
-
                     stake = calculate_stake(bankroll, kelly["kelly_pct"])
                     all_picks.append({
-                        "game":     game,
-                        "analysis": analysis,
-                        "edge":     edge,
-                        "kelly":    kelly,
-                        "stake":    stake,
+                        "game": game, "analysis": analysis,
+                        "edge": edge, "kelly": kelly, "stake": stake,
                     })
+
+                for vp in value_plays:
+                    vp["game"] = game
+                    vp["analysis"] = analysis
+                    best_value.append(vp)
+
             except Exception as e:
-                log.warning(f"Error analyzing game {game.get('game_id')}: {e}")
-                continue
+                log.warning(f"Digest error game {game.get('game_id')}: {e}")
 
-        # Sort by edge descending
         all_picks.sort(key=lambda p: p["edge"]["edge_pct"], reverse=True)
+        best_value.sort(key=lambda p: p.get("gap_pct", 0), reverse=True)
 
-        # Send digest
+        # ── Send edge picks digest ─────────────────────────────────────────
+        from formatters import format_daily_digest
         digest_msg = format_daily_digest(all_picks)
         await context.bot.send_message(
-            chat_id=chat_id,
-            text=digest_msg,
-            parse_mode="Markdown",
+            chat_id=chat_id, text=digest_msg, parse_mode="Markdown"
         )
 
-        # Send individual detailed cards for top 3
-        for pick in all_picks[:3]:
-            reasoning = generate_reasoning(
-                pick["analysis"], pick["edge"], pick["game"]
-            )
-            alert_msg = format_edge_alert(
-                pick["game"], pick["edge"],
-                pick["analysis"], pick["kelly"], pick["stake"]
-            )
-            full_msg = f"{alert_msg}\n\n{reasoning}"
-
+        # ── Send best value plays (even without poly edge) ─────────────────
+        if best_value:
+            bv_lines = [
+                f"{E['diamond']} *Best Value Plays — Model vs Vegas*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"These plays show model/Vegas disagreement even\n"
+                f"where no Polymarket edge was found.\n\n"
+            ]
+            for vp in best_value[:5]:
+                g = vp.get("game", {})
+                away = g.get("away_abbrev", "???")
+                home = g.get("home_abbrev", "???")
+                tag = "📊 Model vs Vegas" if vp["type"] == "best_value" else "🧠 Model Conviction"
+                bv_lines.append(
+                    f"*{away} @ {home}*\n"
+                    f"  {E['target']} {vp['bet_desc']}\n"
+                    f"  {tag}: `+{vp['gap_pct']:.1f}%` gap\n"
+                    f"  {vp['reasoning']}\n"
+                )
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=full_msg,
+                text="\n".join(bv_lines),
+                parse_mode="Markdown",
+            )
+
+        # ── Send top 3 detailed pick cards ────────────────────────────────
+        for pick in all_picks[:3]:
+            from formatters import format_edge_alert
+            reasoning = generate_reasoning_v2(pick["analysis"], pick["edge"], pick["game"])
+            alert_msg = format_edge_alert(
+                pick["game"], pick["edge"], pick["analysis"],
+                pick["kelly"], pick["stake"]
+            )
+            # Add smart money note if Heisenberg confirmed
+            if pick["edge"].get("heis_confirms"):
+                alert_msg += f"\n\n{E['diamond']} *Heisenberg smart money confirms this side*"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{alert_msg}\n\n{reasoning}",
                 parse_mode="Markdown",
             )
             await asyncio.sleep(1)
 
-        await log_alert("digest", "", f"Sent {len(all_picks)} picks")
+        await log_alert("digest", "", f"Sent {len(all_picks)} picks, {len(best_value)} value plays")
 
     except Exception as e:
         log.error(f"Daily digest error: {e}")
@@ -479,93 +505,120 @@ async def run_injury_check(context) -> None:
 
 async def _analyze_single_game(game: dict, markets: list[dict],
                                 min_edge: float) -> tuple[dict, list[dict]]:
-    """Run full analysis on a single game and find edges."""
+    """
+    Full 4-layer analysis pipeline for a single game.
+    Layer 1: Statistical (MLB Stats API + Statcast)
+    Layer 2: Vegas sharp prior (The Odds API)
+    Layer 3: Smart money (Heisenberg elite wallets)
+    Layer 4: Market structure (Market 360 whale/volume/winning side)
+    """
+    from heisenberg import find_game_markets, get_full_market_signal
+    from model_v2 import (
+        analyze_game_v2, find_edges_v2, get_best_value_plays,
+        kelly_criterion, calculate_stake,
+    )
 
-    # Fetch all data concurrently
     home_team = game.get("home_team", "")
     away_team = game.get("away_team", "")
-    home_pid = game.get("home_pitcher", {}).get("id")
-    away_pid = game.get("away_pitcher", {}).get("id")
+    home_pid  = game.get("home_pitcher", {}).get("id")
+    away_pid  = game.get("away_pitcher", {}).get("id")
 
-    tasks = [
+    # ── Fetch statistical data concurrently ───────────────────────────────
+    stat_tasks = [
         get_team_recent_form(home_team),
         get_team_recent_form(away_team),
         get_head_to_head(home_team, away_team),
     ]
+    if home_pid: stat_tasks.append(get_pitcher_detailed(home_pid))
+    if away_pid: stat_tasks.append(get_pitcher_detailed(away_pid))
 
-    if home_pid:
-        tasks.append(get_pitcher_detailed(home_pid))
-    if away_pid:
-        tasks.append(get_pitcher_detailed(away_pid))
-
-    # Get team IDs for stats
     home_tid = await search_team_id(home_team)
     away_tid = await search_team_id(away_team)
-    if home_tid:
-        tasks.append(get_team_stats(home_tid))
-    if away_tid:
-        tasks.append(get_team_stats(away_tid))
+    if home_tid: stat_tasks.append(get_team_stats(home_tid))
+    if away_tid: stat_tasks.append(get_team_stats(away_tid))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Fetch Heisenberg game markets concurrently with stats
+    heis_markets_task = find_game_markets(away_team, home_team)
 
-    # Unpack results safely
+    stat_results, heis_markets = await asyncio.gather(
+        asyncio.gather(*stat_tasks, return_exceptions=True),
+        heis_markets_task,
+        return_exceptions=True,
+    )
+
+    if isinstance(stat_results, Exception):
+        stat_results = []
+    if isinstance(heis_markets, Exception):
+        heis_markets = []
+
+    # Unpack statistical results
     idx = 0
-    home_form = results[idx] if not isinstance(results[idx], Exception) else {"available": False}
-    idx += 1
-    away_form = results[idx] if not isinstance(results[idx], Exception) else {"available": False}
-    idx += 1
-    h2h = results[idx] if not isinstance(results[idx], Exception) else {"available": False}
-    idx += 1
+    def _safe(i): return stat_results[i] if i < len(stat_results) and not isinstance(stat_results[i], Exception) else {}
 
-    home_pitcher_stats = {}
-    if home_pid:
-        hp = results[idx] if idx < len(results) and not isinstance(results[idx], Exception) else {}
-        home_pitcher_stats = hp.get("season", {})
-        idx += 1
+    home_form        = _safe(idx) or {"available": False}; idx += 1
+    away_form        = _safe(idx) or {"available": False}; idx += 1
+    h2h              = _safe(idx) or {"available": False}; idx += 1
+    home_pitcher_raw = _safe(idx) if home_pid else {}; idx += (1 if home_pid else 0)
+    away_pitcher_raw = _safe(idx) if away_pid else {}; idx += (1 if away_pid else 0)
+    home_team_stats  = _safe(idx) if home_tid else {}; idx += (1 if home_tid else 0)
+    away_team_stats  = _safe(idx) if away_tid else {}
 
-    away_pitcher_stats = {}
-    if away_pid:
-        ap = results[idx] if idx < len(results) and not isinstance(results[idx], Exception) else {}
-        away_pitcher_stats = ap.get("season", {})
-        idx += 1
+    home_p_stats = home_pitcher_raw.get("season", {})
+    away_p_stats = away_pitcher_raw.get("season", {})
 
-    home_team_stats = {}
-    if home_tid and idx < len(results):
-        hts = results[idx] if not isinstance(results[idx], Exception) else {}
-        home_team_stats = hts
-        idx += 1
+    # ── Fetch Heisenberg signals for all matching markets ──────────────────
+    heis_signals = {}
+    if heis_markets:
+        signal_tasks = [get_full_market_signal(m) for m in heis_markets[:6]]
+        signals = await asyncio.gather(*signal_tasks, return_exceptions=True)
+        for mkt, sig in zip(heis_markets, signals):
+            if not isinstance(sig, Exception):
+                mt = mkt.get("market_type", "other")
+                heis_signals[mt] = sig
 
-    away_team_stats = {}
-    if away_tid and idx < len(results):
-        ats = results[idx] if not isinstance(results[idx], Exception) else {}
-        away_team_stats = ats
-        idx += 1
-
-    # Run model
-    analysis = analyze_game(
-        home_pitcher_stats=home_pitcher_stats,
-        away_pitcher_stats=away_pitcher_stats,
+    # ── Run 4-layer model ──────────────────────────────────────────────────
+    analysis = await analyze_game_v2(
+        home_team=home_team,
+        away_team=away_team,
+        venue=game.get("venue", ""),
+        home_pitcher_stats=home_p_stats,
+        away_pitcher_stats=away_p_stats,
+        home_pitcher_statcast={},
+        away_pitcher_statcast={},
         home_team_batting=home_team_stats.get("hitting", {}),
         away_team_batting=away_team_stats.get("hitting", {}),
         home_team_pitching=home_team_stats.get("pitching", {}),
         away_team_pitching=away_team_stats.get("pitching", {}),
         home_recent_form=home_form,
         away_recent_form=away_form,
-        venue=game.get("venue", ""),
         h2h=h2h,
+        heisenberg_signals=heis_signals,
     )
+    # Attach team names for reasoning
+    analysis["home_team"] = home_team
+    analysis["away_team"] = away_team
 
-    # Find matching markets and edges
+    # ── Find Polymarket edges ──────────────────────────────────────────────
     all_edges = []
-    for market in markets:
-        q = market.get("question", "").lower()
+    for mkt_raw in markets:
+        q       = (mkt_raw.get("question") or "").lower()
         away_kw = away_team.lower().split()[-1]
         home_kw = home_team.lower().split()[-1]
 
-        if any(kw in q for kw in [away_kw, home_kw]):
-            odds_data = await get_market_implied_odds(market)
-            odds_data["market_type"] = market.get("market_type", "moneyline")
-            edges = find_edges(analysis, odds_data, min_edge)
-            all_edges.extend(edges)
+        if not any(kw in q for kw in [away_kw, home_kw]):
+            continue
 
-    return analysis, all_edges
+        from polymarket import get_market_implied_odds
+        odds_data = await get_market_implied_odds(mkt_raw)
+        odds_data["market_type"] = mkt_raw.get("market_type", "moneyline")
+
+        # Get Heisenberg signal for this specific market type
+        heis_sig = heis_signals.get(odds_data["market_type"])
+
+        edges = find_edges_v2(analysis, odds_data, heis_sig, min_edge)
+        all_edges.extend(edges)
+
+    # ── Best value plays (even without explicit Poly edge) ─────────────────
+    value_plays = get_best_value_plays(analysis, game)
+
+    return analysis, all_edges, value_plays, heis_signals

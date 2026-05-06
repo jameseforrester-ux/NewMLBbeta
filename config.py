@@ -27,6 +27,9 @@ POLY_CLOB_API    = "https://clob.polymarket.com"
 # ── The Odds API ─────────────────────────────────────────────────────────────
 ODDS_API_BASE    = "https://api.the-odds-api.com/v4"
 
+# ── Heisenberg PMI ──────────────────────────────────────────────────────────
+HEISENBERG_TOKEN = os.getenv("HEISENBERG_TOKEN", "")
+
 # ── Betting Defaults ────────────────────────────────────────────────────────
 DEFAULT_BANKROLL      = float(os.getenv("BANKROLL", "1000.0"))
 DEFAULT_MIN_EDGE      = float(os.getenv("MIN_EDGE_PCT", "6.0"))
