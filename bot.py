@@ -1008,10 +1008,10 @@ def main():
             name="daily_digest",
         )
 
-        # Live game monitor (every 2 minutes)
+        # Live game monitor (polls every 5 min, alerts only on threshold triggers)
         jq.run_repeating(
             run_live_monitor,
-            interval=120,
+            interval=300,
             first=30,
             data={"chat_id": int(chat_id)},
             name="live_monitor",
