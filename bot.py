@@ -51,6 +51,11 @@ from formatters import (
     format_pitcher_report, format_h2h, format_recent_form,
     format_live_alert, format_line_movement,
 )
+from market_scanner import (
+    scan_all_markets, format_full_scan_summary,
+    format_edge_by_type, format_value_plays_section,
+    format_game_market_breakdown,
+)
 from alerts import (
     run_daily_digest, run_live_monitor, run_injury_check,
     _analyze_single_game,
@@ -75,19 +80,22 @@ def main_menu_keyboard():
             InlineKeyboardButton(f"{E['fire']} Find Edges", callback_data="scan"),
         ],
         [
+            InlineKeyboardButton(f"🔭 Full Market Scan", callback_data="full_scan"),
             InlineKeyboardButton(f"{E['chart']} Markets", callback_data="markets"),
-            InlineKeyboardButton(f"{E['trophy']} Standings", callback_data="standings"),
         ],
         [
+            InlineKeyboardButton(f"{E['trophy']} Standings", callback_data="standings"),
             InlineKeyboardButton(f"{E['mag']} Research", callback_data="research"),
+        ],
+        [
             InlineKeyboardButton(f"{E['money']} P&L", callback_data="pnl"),
+            InlineKeyboardButton(f"{E['memo']} Bet History", callback_data="history"),
         ],
         [
             InlineKeyboardButton(f"{E['bell']} Alerts", callback_data="alerts_menu"),
             InlineKeyboardButton(f"{E['gear']} Settings", callback_data="settings"),
         ],
         [
-            InlineKeyboardButton(f"{E['memo']} Bet History", callback_data="history"),
             InlineKeyboardButton(f"{E['refresh']} Refresh", callback_data="refresh"),
         ],
     ])
@@ -204,6 +212,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_fullscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /fullscan command."""
+    await _run_full_market_scan(update.message, context)
+
+
 async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /games command."""
     await _show_games(update.message, context)
@@ -236,7 +249,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"/start — Main menu\n"
         f"/games — Today's games\n"
-        f"/scan — Scan all games for edges\n"
+        f"/scan — Quick edge scan\n"
+        f"/fullscan — All markets: ML + O/U + Run Line + NRFI\n"
         f"/pnl — Performance dashboard\n"
         f"/standings — MLB standings\n"
         f"/settings — Bot settings\n"
@@ -299,6 +313,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("gmarkets_"):
             game_id = int(data.split("_", 1)[1])
             await _show_game_markets(query, context, game_id)
+
+        elif data == "full_scan":
+            await _run_full_market_scan(query, context)
 
         elif data == "scan":
             await _run_edge_scan(query, context)
@@ -814,6 +831,78 @@ async def _show_game_markets(query: CallbackQuery, context, game_id: int):
     )
 
 
+async def _run_full_market_scan(target, context):
+    """
+    Sweep ALL Polymarket MLB markets across every type for every game.
+    Moneyline + Over/Under + Run Line + NRFI — evaluated simultaneously.
+    """
+    await _send_msg(
+        target,
+        f"🔭 *Full Market Scan*\n"
+        f"Sweeping all ML, O/U, Run Line & NRFI markets...\n"
+        f"This takes 20-30 seconds.",
+        ParseMode.MARKDOWN,
+    )
+
+    games      = await get_todays_schedule()
+    bankroll   = await get_bankroll()
+    min_edge   = await get_min_edge()
+    kelly_frac = await get_kelly_fraction()
+
+    try:
+        result = await scan_all_markets(
+            games=games,
+            min_edge=min_edge,
+            bankroll=bankroll,
+            kelly_frac=kelly_frac,
+        )
+
+        # ── Summary header ────────────────────────────────────────────────
+        summary = format_full_scan_summary(result)
+        await _send_msg(target, summary, ParseMode.MARKDOWN, main_menu_keyboard())
+
+        # ── Edges grouped by market type ──────────────────────────────────
+        type_messages = format_edge_by_type(
+            result["by_type"], result["by_game"], bankroll
+        )
+        for msg in type_messages:
+            if msg.strip():
+                await _send_msg(target, msg, ParseMode.MARKDOWN)
+                await asyncio.sleep(0.4)
+
+        # ── Value plays vs Vegas ──────────────────────────────────────────
+        value_section = format_value_plays_section(result["value_plays"])
+        if value_section:
+            await _send_msg(target, value_section, ParseMode.MARKDOWN)
+
+        # ── Top overall pick (most detailed) ──────────────────────────────
+        if result["edges"]:
+            top = result["edges"][0]
+            from formatters import format_edge_alert
+            from model_v2 import generate_reasoning_v2
+            kelly = top.get("kelly", {})
+            stake = top.get("stake", 0)
+            alert_msg = format_edge_alert(
+                top["game"], top, top["analysis"], kelly, stake
+            )
+            reasoning = generate_reasoning_v2(top["analysis"], top, top["game"])
+            heis_note = f"\n\n{E['diamond']} *Smart money confirms*" if top.get("heis_confirms") else ""
+            await _send_msg(
+                target,
+                f"🏆 *Top Pick Details*\n\n{alert_msg}\n\n{reasoning}{heis_note}",
+                ParseMode.MARKDOWN,
+            )
+
+    except Exception as e:
+        log.error(f"Full scan error: {e}")
+        await _send_msg(
+            target,
+            f"{E['x']} Scan error: {str(e)[:300]}\n\nTry `/scan` for a lighter sweep.",
+            ParseMode.MARKDOWN,
+            main_menu_keyboard(),
+        )
+
+
 async def _run_edge_scan(target, context):
     """Full edge scan across all today's games."""
     await _send_msg(target, f"{E['refresh']} Scanning entire slate for edges...")
@@ -1021,6 +1110,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("games", cmd_games))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("fullscan", cmd_fullscan))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("standings", cmd_standings))
