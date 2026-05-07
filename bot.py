@@ -52,9 +52,12 @@ from formatters import (
     format_live_alert, format_line_movement,
 )
 from market_scanner import (
-    scan_all_markets, format_full_scan_summary,
-    format_edge_by_type, format_value_plays_section,
-    format_game_market_breakdown,
+    scan_all_markets,
+    format_full_scan_summary,
+    format_full_scan_edges_by_type,
+    format_value_plays_section,
+    format_game_full_comparison,
+    format_skipped_games,
 )
 from alerts import (
     run_daily_digest, run_live_monitor, run_injury_check,
@@ -833,14 +836,13 @@ async def _show_game_markets(query: CallbackQuery, context, game_id: int):
 
 async def _run_full_market_scan(target, context):
     """
-    Sweep ALL Polymarket MLB markets across every type for every game.
-    Moneyline + Over/Under + Run Line + NRFI — evaluated simultaneously.
+    Full sweep: all 4 market types, pre-game only, complete model vs market table.
     """
     await _send_msg(
         target,
         f"🔭 *Full Market Scan*\n"
-        f"Sweeping all ML, O/U, Run Line & NRFI markets...\n"
-        f"This takes 20-30 seconds.",
+        f"Sweeping ML · O/U · Run Line · NRFI across all pre-game games...\n"
+        f"_Takes ~30 seconds._",
         ParseMode.MARKDOWN,
     )
 
@@ -851,45 +853,64 @@ async def _run_full_market_scan(target, context):
 
     try:
         result = await scan_all_markets(
-            games=games,
-            min_edge=min_edge,
-            bankroll=bankroll,
-            kelly_frac=kelly_frac,
+            games=games, min_edge=min_edge,
+            bankroll=bankroll, kelly_frac=kelly_frac,
         )
 
-        # ── Summary header ────────────────────────────────────────────────
-        summary = format_full_scan_summary(result)
-        await _send_msg(target, summary, ParseMode.MARKDOWN, main_menu_keyboard())
-
-        # ── Edges grouped by market type ──────────────────────────────────
-        type_messages = format_edge_by_type(
-            result["by_type"], result["by_game"], bankroll
+        # 1 — Summary header
+        await _send_msg(
+            target, format_full_scan_summary(result),
+            ParseMode.MARKDOWN, main_menu_keyboard()
         )
-        for msg in type_messages:
+
+        # 2 — Skipped live/final games
+        skipped_msg = format_skipped_games(result.get("skipped", []))
+        if skipped_msg:
+            await _send_msg(target, skipped_msg, ParseMode.MARKDOWN)
+
+        # 3 — Edges by type (only if found)
+        edge_msgs = format_full_scan_edges_by_type(
+            result["by_type"], bankroll
+        )
+        for msg in edge_msgs:
             if msg.strip():
                 await _send_msg(target, msg, ParseMode.MARKDOWN)
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.3)
 
-        # ── Value plays vs Vegas ──────────────────────────────────────────
-        value_section = format_value_plays_section(result["value_plays"])
-        if value_section:
-            await _send_msg(target, value_section, ParseMode.MARKDOWN)
+        # 4 — Value vs Vegas
+        val_msg = format_value_plays_section(result.get("value_plays", []))
+        if val_msg:
+            await _send_msg(target, val_msg, ParseMode.MARKDOWN)
 
-        # ── Top overall pick (most detailed) ──────────────────────────────
+        # 5 — Full model vs market table per game
+        await _send_msg(
+            target,
+            f"{E['base']} *Full comparison by game:*",
+            ParseMode.MARKDOWN,
+        )
+        for gid, gdata in result.get("by_game", {}).items():
+            msgs = format_game_full_comparison(gdata)
+            for msg in msgs:
+                if msg.strip():
+                    await _send_msg(target, msg, ParseMode.MARKDOWN)
+                    await asyncio.sleep(0.2)
+
+        # 6 — Top pick detail card
         if result["edges"]:
             top = result["edges"][0]
             from formatters import format_edge_alert
             from model_v2 import generate_reasoning_v2
-            kelly = top.get("kelly", {})
-            stake = top.get("stake", 0)
             alert_msg = format_edge_alert(
-                top["game"], top, top["analysis"], kelly, stake
+                top["game"], top, top["analysis"],
+                top["kelly"], top["stake"]
             )
-            reasoning = generate_reasoning_v2(top["analysis"], top, top["game"])
-            heis_note = f"\n\n{E['diamond']} *Smart money confirms*" if top.get("heis_confirms") else ""
+            reasoning = generate_reasoning_v2(
+                top["analysis"], top, top["game"]
+            )
+            heis = f"\n\n{E['diamond']} *Smart money confirms*" if top.get("heis_confirms") else ""
             await _send_msg(
                 target,
-                f"🏆 *Top Pick Details*\n\n{alert_msg}\n\n{reasoning}{heis_note}",
+                f"🏆 *Top Pick*\n\n{alert_msg}\n\n{reasoning}{heis}",
                 ParseMode.MARKDOWN,
             )
 
@@ -897,9 +918,8 @@ async def _run_full_market_scan(target, context):
         log.error(f"Full scan error: {e}")
         await _send_msg(
             target,
-            f"{E['x']} Scan error: {str(e)[:300]}\n\nTry `/scan` for a lighter sweep.",
-            ParseMode.MARKDOWN,
-            main_menu_keyboard(),
+            f"{E['x']} Scan error: `{str(e)[:300]}`\n\nTry `/scan` for a lighter sweep.",
+            ParseMode.MARKDOWN, main_menu_keyboard(),
         )
 
 
